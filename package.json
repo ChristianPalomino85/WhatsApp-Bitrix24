@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "node src/server.js",
     "worker": "node src/worker.js",
-    "start": "pm2 start ecosystem.config.js && pm2 logs --lines 100"
+    "start": "pm2 start ecosystem.config.cjs && pm2 logs --lines 100"
   },
   "dependencies": {
     "axios": "^1.7.4",
