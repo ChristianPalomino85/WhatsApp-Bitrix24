@@ -2,6 +2,7 @@ import 'dotenv/config';
 import db from './lib/db.js';
 import { fetchBatch, markDone, markFailed } from './lib/queue.js';
 import { sendTemplate, inWindow } from './lib/wa.js';
+import { isLikelyValidPhone } from './lib/phone.js';
 
 const TOKEN = process.env.WA_ACCESS_TOKEN;
 const LANG = process.env.WA_TEMPLATE_LANG || 'es';
@@ -31,7 +32,7 @@ async function tick() {
       const target = db.prepare('SELECT * FROM campaign_targets WHERE id=?').get(job.target_id);
       if (!target) { markDone(job.id); continue; }
 
-      if (!/^\d{7,15}$/.test(target.phone)) {
+      if (!isLikelyValidPhone(target.phone)) {
         db.prepare('UPDATE campaign_targets SET status=?, last_error=?, updated_at=? WHERE id=?')
           .run('failed', 'telefono_invalido', new Date().toISOString(), target.id);
         markDone(job.id);
@@ -44,7 +45,9 @@ async function tick() {
 
         const vars = JSON.parse(target.vars_json || '{}');
         const components = [];
-        const bodyParams = Object.values(vars).map(v => ({ type: 'text', text: String(v) }));
+        const bodyParams = Object.entries(vars)
+          .filter(([key]) => !String(key).startsWith('_'))
+          .map(([, value]) => ({ type: 'text', text: String(value) }));
         if (bodyParams.length) components.push({ type: 'body', parameters: bodyParams });
 
         const resp = await sendTemplate({
