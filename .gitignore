@@ -11,3 +11,9 @@ coverage/
 *.key
 *.crt
 tmp/
+
+# datos locales
+data/
+
+# datos locales
+data/
