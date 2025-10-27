@@ -74,6 +74,12 @@ Puedes operar varios remitentes dentro del mismo despliegue siempre que el token
 - Considera rotar el token permanente en Meta si se expuso públicamente.
 - Protege los endpoints con `API_TOKEN` o una red privada.
 
+## Después de hacer cambios
+1. Ejecuta las pruebas relevantes (`npm run dev` para validar el arranque, `npm run worker` en una segunda terminal y pruebas unitarias cuando estén disponibles).
+2. Revisa los logs para confirmar que el worker toma campañas y detecta errores de configuración antes de publicarlos.
+3. Crea un commit descriptivo y abre un Pull Request resumiendo los cambios y las pruebas realizadas.
+4. Una vez aprobado, despliega el API y el worker junto con la configuración `.env` que corresponda al número de WhatsApp que vayas a usar.
+
 ## Salud de la integración
 - Usa `GET /api/bitrix/health` para verificar que el token de Bitrix está vigente.
 - Revisa los registros del worker para confirmar que los envíos se procesan correctamente.
