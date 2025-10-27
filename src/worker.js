@@ -2,6 +2,7 @@ import 'dotenv/config';
 import db from './lib/db.js';
 import { fetchBatch, markDone, markFailed } from './lib/queue.js';
 import { sendTemplate, inWindow } from './lib/wa.js';
+import { isLikelyValidPhone } from './lib/phone.js';
 
 const TOKEN = process.env.WA_ACCESS_TOKEN;
 const LANG = process.env.WA_TEMPLATE_LANG || 'es';
@@ -31,7 +32,15 @@ async function tick() {
       const target = db.prepare('SELECT * FROM campaign_targets WHERE id=?').get(job.target_id);
       if (!target) { markDone(job.id); continue; }
 
-      if (!/^\d{7,15}$/.test(target.phone)) {
+      const senderPhoneId = job.phone_id || camp.sender_phone_id;
+      if (!senderPhoneId) {
+        db.prepare('UPDATE campaign_targets SET status=?, last_error=?, updated_at=? WHERE id=?')
+          .run('failed', 'sin_sender_configurado', new Date().toISOString(), target.id);
+        markDone(job.id);
+        continue;
+      }
+
+      if (!isLikelyValidPhone(target.phone)) {
         db.prepare('UPDATE campaign_targets SET status=?, last_error=?, updated_at=? WHERE id=?')
           .run('failed', 'telefono_invalido', new Date().toISOString(), target.id);
         markDone(job.id);
@@ -44,11 +53,13 @@ async function tick() {
 
         const vars = JSON.parse(target.vars_json || '{}');
         const components = [];
-        const bodyParams = Object.values(vars).map(v => ({ type: 'text', text: String(v) }));
+        const bodyParams = Object.entries(vars)
+          .filter(([key]) => !String(key).startsWith('_'))
+          .map(([, value]) => ({ type: 'text', text: String(value) }));
         if (bodyParams.length) components.push({ type: 'body', parameters: bodyParams });
 
         const resp = await sendTemplate({
-          phone_id: camp.sender_phone_id,
+          phone_id: senderPhoneId,
           token: TOKEN,
           to: target.phone,
           template_name: camp.template_name,
@@ -79,8 +90,12 @@ async function tick() {
     if (pending === 0) {
       const camps = db.prepare("SELECT id FROM campaigns WHERE status='running'").all();
       for (const c of camps) {
-        const left = db.prepare("SELECT COUNT(1) c FROM campaign_targets WHERE campaign_id=? AND status IN ('queued','sending','failed')").get(c.id).c;
-        if (left === 0) db.prepare("UPDATE campaigns SET status='done' WHERE id=?").run(c.id);
+        const leftActive = db.prepare("SELECT COUNT(1) c FROM campaign_targets WHERE campaign_id=? AND status IN ('queued','sending')").get(c.id).c;
+        if (leftActive === 0) {
+          const failed = db.prepare("SELECT COUNT(1) c FROM campaign_targets WHERE campaign_id=? AND status='failed'").get(c.id).c;
+          const newStatus = failed > 0 ? 'error' : 'done';
+          db.prepare("UPDATE campaigns SET status=? WHERE id=?").run(newStatus, c.id);
+        }
       }
     }
   } catch (e) {
