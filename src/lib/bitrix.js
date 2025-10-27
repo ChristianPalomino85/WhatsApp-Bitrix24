@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import axios from 'axios';
-import { normalizePhone } from './phone.js';
+import { normalizePhone, isLikelyValidPhone } from './phone.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -221,7 +221,7 @@ export async function fetchTargetsFromBitrix({ entity = 'lead', ids = [], varFie
   const targets = [];
   for (const row of rows) {
     const phone = extractPhoneFromEntity(row, defaultCountryCode);
-    if (!phone) continue;
+    if (!isLikelyValidPhone(phone)) continue;
 
     const vars = {};
     for (const [varName, fieldPath] of Object.entries(varFields || {})) {

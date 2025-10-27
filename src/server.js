@@ -16,6 +16,7 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
+app.use(bodyParser.urlencoded({ extended: true }));
 app.use(bodyParser.json({
   limit: '2mb',
   verify: (req, _res, buf) => {
@@ -27,6 +28,8 @@ app.use(morgan('dev'));
 const PORT = process.env.PORT || 3001;
 const API_TOKEN = process.env.API_TOKEN || '';
 const DEFAULT_LANG = process.env.WA_TEMPLATE_LANG || 'es';
+const DEFAULT_COUNTRY_CODE = (process.env.DEFAULT_COUNTRY_CODE || process.env.BITRIX_DEFAULT_COUNTRY_CODE || '')
+  .replace(/\D/g, '');
 
 if (API_TOKEN) {
   app.use('/api', (req, res, next) => {
@@ -43,18 +46,141 @@ app.use('/', express.static(path.join(__dirname, 'ui')));
 
 // Helpers
 function nowIso() { return new Date().toISOString(); }
-function normalizeTargets(targets = []) {
-  return targets
-    .map((t) => ({
-      phone: normalizePhone(t.phone),
-      vars: t.vars || {}
-    }))
-    .filter((t) => t.phone);
+function parseJsonValue(raw, { fallback = null, allowPlainString = true } = {}) {
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw !== 'string') return raw;
+  const trimmed = raw.trim();
+  if (!trimmed) return fallback;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return allowPlainString ? trimmed : fallback;
+  }
 }
 
-function createCampaignRecord({ name, template_name, language = DEFAULT_LANG, targets = [], meta = null }) {
-  const sender_phone_id = ensureSender();
-  const normalizedTargets = normalizeTargets(targets);
+function coerceBoolean(val, defaultValue = false) {
+  if (val === undefined || val === null || val === '') return defaultValue;
+  if (typeof val === 'boolean') return val;
+  if (typeof val === 'number') return val !== 0;
+  if (typeof val === 'string') {
+    const normalized = val.trim().toLowerCase();
+    if (!normalized) return defaultValue;
+    return ['1', 'true', 'yes', 'on'].includes(normalized);
+  }
+  return defaultValue;
+}
+
+function arrayFrom(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'object') return arrayFrom(Object.values(raw));
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return [];
+    try {
+      return arrayFrom(JSON.parse(trimmed));
+    } catch {
+      return trimmed.split(/[\s,;\n]+/g);
+    }
+  }
+  return [];
+}
+
+function parseIds(raw) {
+  return arrayFrom(raw).map(String).map((s) => s.trim()).filter(Boolean);
+}
+
+function parseVarFields(raw) {
+  const parsed = parseJsonValue(raw, { fallback: {}, allowPlainString: false });
+  const source = (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+  const out = {};
+  for (const [key, value] of Object.entries(source)) {
+    const name = String(key || '').trim();
+    if (!name) continue;
+    if (value === undefined || value === null) continue;
+    out[name] = String(value).trim();
+  }
+  return out;
+}
+
+function parseSenderId(raw) {
+  if (raw === undefined || raw === null) return null;
+  const str = String(raw).trim();
+  return str || null;
+}
+
+function parseSenderDisplay(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    return trimmed || null;
+  }
+  const str = String(raw).trim();
+  return str || null;
+}
+
+function toTargetObject(entry) {
+  if (!entry) return null;
+  if (typeof entry === 'string') {
+    const trimmed = entry.trim();
+    if (!trimmed) return null;
+    return { phone: trimmed, vars: {} };
+  }
+  if (typeof entry === 'object') {
+    const phone = entry.phone || entry.number || entry.to;
+    if (!phone) return null;
+    const rawVars = entry.vars || entry.values || entry.meta || {};
+    const varsParsed = parseJsonValue(rawVars, { fallback: {}, allowPlainString: false });
+    return {
+      phone: String(phone).trim(),
+      vars: (varsParsed && typeof varsParsed === 'object' && !Array.isArray(varsParsed)) ? varsParsed : {}
+    };
+  }
+  return null;
+}
+
+function parseTargetsInput(raw) {
+  const parsed = parseJsonValue(raw, { fallback: raw });
+  const base = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === 'object' && parsed.phone ? [parsed] : parsed);
+  const list = arrayFrom(base);
+  const targets = [];
+  for (const item of list) {
+    const target = toTargetObject(item);
+    if (target) targets.push(target);
+  }
+  return targets;
+}
+
+function normalizeTargets(targets = []) {
+  const normalized = [];
+  let skipped = 0;
+
+  for (const target of targets || []) {
+    const phone = normalizePhone(target?.phone, { defaultCountryCode: DEFAULT_COUNTRY_CODE });
+    if (!isLikelyValidPhone(phone)) {
+      skipped += 1;
+      continue;
+    }
+    normalized.push({
+      phone,
+      vars: target?.vars || {}
+    });
+  }
+
+  return { normalized, skipped };
+}
+
+function createCampaignRecord({
+  name,
+  template_name,
+  language = DEFAULT_LANG,
+  targets = [],
+  meta = null,
+  sender_phone_id: requestedSender,
+  sender_display: requestedDisplay
+}) {
+  const sender_phone_id = ensureSender(requestedSender, { display: requestedDisplay });
+  const { normalized: normalizedTargets, skipped } = normalizeTargets(targets);
 
   if (!normalizedTargets.length) {
     throw new Error('No hay destinatarios válidos para la campaña');
@@ -84,14 +210,22 @@ function createCampaignRecord({ name, template_name, language = DEFAULT_LANG, ta
     return { campaign_id, inserted, sender_phone_id };
   });
 
-  return tx();
+  const result = tx();
+  const duplicates = normalizedTargets.length - result.inserted;
+  const senderRow = db.prepare('SELECT display FROM senders WHERE phone_id=?').get(result.sender_phone_id);
+  return {
+    ...result,
+    skipped_invalid: skipped,
+    duplicates: duplicates > 0 ? duplicates : 0,
+    sender_display: senderRow?.display || null
+  };
 }
 
 function startCampaign(campaign_id) {
   const camp = db.prepare('SELECT * FROM campaigns WHERE id=?').get(campaign_id);
   if (!camp) throw new Error('Campaña no existe');
 
-  const phone_id = camp.sender_phone_id || ensureSender();
+  const phone_id = ensureSender(camp.sender_phone_id);
   const targets = db.prepare(`SELECT id FROM campaign_targets WHERE campaign_id=? AND status IN ('queued','failed')`).all(campaign_id);
 
   const tx = db.transaction(() => {
@@ -157,27 +291,65 @@ function verifyWaSignature(req) {
   if (expectedHeader.length !== provided.length) return false;
   return crypto.timingSafeEqual(Buffer.from(expectedHeader), Buffer.from(provided));
 }
-function ensureSender() {
-  const phone_id = process.env.WA_PHONE_NUMBER_ID;
-  if (!phone_id) throw new Error('Falta WA_PHONE_NUMBER_ID en .env');
-  const exists = db.prepare('SELECT 1 FROM senders WHERE phone_id=?').get(phone_id);
-  if (!exists) {
-    db.prepare('INSERT OR IGNORE INTO senders (phone_id, display, qps, created_at) VALUES (?, ?, ?, ?)')
-      .run(phone_id, `+${phone_id}`, Number(process.env.SENDER_QPS || 8), nowIso());
+function ensureSender(phone_id, { display } = {}) {
+  const resolved = parseSenderId(phone_id) || parseSenderId(process.env.WA_PHONE_NUMBER_ID);
+  if (!resolved) {
+    throw new Error('Debes configurar WA_PHONE_NUMBER_ID en .env o enviar sender_phone_id.');
   }
-  return phone_id;
+
+  const existing = db.prepare('SELECT display, qps FROM senders WHERE phone_id=?').get(resolved);
+  const desiredDisplay = parseSenderDisplay(display) || existing?.display || `+${resolved}`;
+  const desiredQps = Number(process.env.SENDER_QPS || existing?.qps || 8);
+
+  if (!existing) {
+    db.prepare('INSERT OR IGNORE INTO senders (phone_id, display, qps, created_at) VALUES (?, ?, ?, ?)')
+      .run(resolved, desiredDisplay, desiredQps, nowIso());
+  } else {
+    if (desiredDisplay && desiredDisplay !== existing.display) {
+      db.prepare('UPDATE senders SET display=? WHERE phone_id=?').run(desiredDisplay, resolved);
+    }
+    if (desiredQps && desiredQps !== existing.qps) {
+      db.prepare('UPDATE senders SET qps=? WHERE phone_id=?').run(desiredQps, resolved);
+    }
+  }
+
+  return resolved;
 }
 
 // Crear campaña
 app.post('/api/campaigns', (req, res) => {
   try {
-    const { name, template_name, language = DEFAULT_LANG, targets, meta } = req.body;
-    if (!name || !template_name || !Array.isArray(targets) || targets.length === 0) {
+    const name = req.body?.name;
+    const template_name = req.body?.template_name || req.body?.template;
+    const language = req.body?.language || DEFAULT_LANG;
+    const rawTargets = req.body?.targets ?? req.body?.phones ?? req.body?.numbers;
+    const meta = parseJsonValue(req.body?.meta, { fallback: null });
+    const targets = parseTargetsInput(rawTargets);
+    const sender_phone_id = parseSenderId(req.body?.sender_phone_id ?? req.body?.sender ?? req.body?.phone_id);
+    const sender_display = parseSenderDisplay(req.body?.sender_display ?? req.body?.sender_name ?? req.body?.senderName);
+
+    if (!name || !template_name || !targets.length) {
       return res.status(400).json({ error: 'Parámetros inválidos' });
     }
 
-    const { campaign_id, inserted } = createCampaignRecord({ name, template_name, language, targets, meta });
-    return res.json({ ok: true, campaign_id, total_targets: inserted });
+    const { campaign_id, inserted, skipped_invalid, duplicates, sender_phone_id: finalSender, sender_display: finalDisplay } = createCampaignRecord({
+      name,
+      template_name,
+      language,
+      targets,
+      meta,
+      sender_phone_id,
+      sender_display
+    });
+    return res.json({
+      ok: true,
+      campaign_id,
+      total_targets: inserted,
+      skipped_invalid,
+      duplicates,
+      sender_phone_id: finalSender,
+      sender_display: finalDisplay
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: e.message });
@@ -248,15 +420,35 @@ app.get('/api/bitrix/health', async (_req, res) => {
 
 app.post('/api/bitrix/campaigns', async (req, res) => {
   try {
-    const { entity = 'lead', ids, template_name, language = DEFAULT_LANG, name, var_fields = {}, auto_start = false, preview = false } = req.body || {};
-    if (!Array.isArray(ids) || ids.length === 0) {
-      return res.status(400).json({ ok: false, error: 'ids debe ser un arreglo con al menos un ID de Bitrix24' });
-    }
+    const entity = String(req.body?.entity || req.query?.entity || 'lead').toLowerCase();
+    const template_name = req.body?.template_name || req.body?.template || req.body?.templateName;
+    const language = req.body?.language || req.body?.lang || DEFAULT_LANG;
+    const var_fields = parseVarFields(req.body?.var_fields ?? req.body?.varFields);
+    const ids = parseIds(req.body?.ids ?? req.body?.id ?? req.body?.entity_id ?? req.query?.ids);
+    const name = req.body?.name || req.body?.campaign_name;
+    const auto_start = coerceBoolean(req.body?.auto_start ?? req.body?.autoStart ?? req.query?.auto_start);
+    const preview = coerceBoolean(req.body?.preview ?? req.body?.dry ?? req.query?.preview);
+    const rawTargets = req.body?.targets ?? req.body?.phones;
+    let targets = parseTargetsInput(rawTargets);
+    let meta = parseJsonValue(req.body?.meta, { fallback: null });
+    const sender_phone_id = parseSenderId(req.body?.sender_phone_id ?? req.body?.sender ?? req.body?.phone_id ?? req.query?.sender_phone_id);
+    const sender_display = parseSenderDisplay(req.body?.sender_display ?? req.body?.sender_name ?? req.query?.sender_display);
+
     if (!template_name) {
       return res.status(400).json({ ok: false, error: 'Falta template_name' });
     }
 
-    const targets = await fetchTargetsFromBitrix({ entity, ids, varFields: var_fields });
+    if (!targets.length) {
+      if (!ids.length) {
+        return res.status(400).json({ ok: false, error: 'Debes indicar ids o targets para crear la campaña' });
+      }
+
+      targets = await fetchTargetsFromBitrix({ entity, ids, varFields: var_fields });
+      meta = meta || { source: { entity, ids, var_fields } };
+    } else if (!meta) {
+      meta = { source: { entity: 'direct', origin: 'bitrix' } };
+    }
+
     if (!targets.length) {
       return res.status(400).json({ ok: false, error: 'No se hallaron teléfonos válidos en Bitrix24' });
     }
@@ -266,15 +458,31 @@ app.post('/api/bitrix/campaigns', async (req, res) => {
     }
 
     const campaignName = name || `${entity.toUpperCase()}-${nowIso()}`;
-    const meta = { source: { entity, ids, var_fields } };
-    const { campaign_id, inserted } = createCampaignRecord({ name: campaignName, template_name, language, targets, meta });
+    const { campaign_id, inserted, skipped_invalid, duplicates, sender_phone_id: finalSender, sender_display: finalDisplay } = createCampaignRecord({
+      name: campaignName,
+      template_name,
+      language,
+      targets,
+      meta,
+      sender_phone_id,
+      sender_display
+    });
 
     let started = null;
     if (auto_start) {
       started = startCampaign(campaign_id);
     }
 
-    res.json({ ok: true, campaign_id, total_targets: inserted, started });
+    res.json({
+      ok: true,
+      campaign_id,
+      total_targets: inserted,
+      skipped_invalid,
+      duplicates,
+      sender_phone_id: finalSender,
+      sender_display: finalDisplay,
+      started
+    });
   } catch (e) {
     console.error('[bitrix] error creando campaña', e);
     res.status(500).json({ ok: false, error: e.message });
