@@ -20,6 +20,16 @@ Este proyecto expone un API y un worker que coordinan campañas de WhatsApp Busi
 
 > ℹ️ Antes de lanzar campañas desde Bitrix24 ejecuta `node tools/b24-auth/server.cjs` (con tus variables `B24_*`) y completa el flujo OAuth; el archivo `data/b24_tokens.json` se usará automáticamente por el API y se refrescará cuando sea necesario.
 
+### Verificación rápida de la configuración
+
+Tras completar el `.env` y obtener los tokens de Bitrix24, ejecuta:
+
+```bash
+npm run doctor
+```
+
+El asistente revisará las variables obligatorias, la conexión con WhatsApp Business y la validez del token de Bitrix24. Si algo falta te mostrará un ❌ con la acción sugerida para corregirlo.
+
 ## Integración con Bitrix24
 
 1. **Crear un webhook/automatización** en Bitrix24 que invoque `POST https://<tu-servidor>/api/bitrix/campaigns` con el token configurado en `API_TOKEN` (cabecera `x-api-key`).
@@ -83,4 +93,5 @@ Puedes operar varios remitentes dentro del mismo despliegue siempre que el token
 ## Salud de la integración
 - Usa `GET /api/bitrix/health` para verificar que el token de Bitrix está vigente.
 - Revisa los registros del worker para confirmar que los envíos se procesan correctamente.
+- Ejecuta `npm run doctor` después de actualizar credenciales o desplegar en un nuevo entorno para validar que todo está listo.
 

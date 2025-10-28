@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "node src/server.js",
     "worker": "node src/worker.js",
+    "doctor": "node tools/doctor.js",
     "start": "pm2 start ecosystem.config.cjs && pm2 logs --lines 100"
   },
   "dependencies": {
